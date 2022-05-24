@@ -1,0 +1,68 @@
+#data ---------------
+source("./data/df_region.r")
+source("./data/company_words.r")
+source("./data/narrative_words.r")
+
+# test data clean-up----------------
+raw_test <- read_csv("./data/complaints_test.csv")
+## clean_the_column_names
+raw_test <- clean_names(raw_test)
+## submitted_via = Web -> DROP
+raw_test<- raw_test %>%
+    select(-submitted_via)
+## don't like the column name consumer_complaint_narrative -> change to narrative
+raw_test <- raw_test %>%
+    rename("narrative" = "consumer_complaint_narrative")
+## need to rename problem_id as row_index
+raw_test <- raw_test %>%
+    rename(row_index = problem_id)
+
+## clean_up zip_code ---------------------
+raw_test <- raw_test %>%
+    mutate(zip_region = str_extract(zip_code,"^.{1}")) %>%
+    select(-zip_code)
+## clean_up state -------------------
+# df_region was created during raw_train munge
+raw_test <- raw_test %>% 
+    left_join(df_region) %>%
+    select(-state)
+
+# clean_up company ----------------------------
+clean_company <- raw_test %>%
+    group_by(row_index) %>%
+    unnest_tokens(word, company) %>%
+    filter(word %in% company_words$word) %>%
+    summarize(company = str_c(word, collapse = " ")) %>%
+    ungroup()
+
+raw_test <- raw_test %>% 
+    select(-company) %>%
+    inner_join(clean_company)
+
+# clean_up narrative ----------------------------
+clean_narrative <- raw_test %>%
+    select(row_index, narrative) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word,narrative)  %>%
+    filter(word %in% narrative_words$word) %>%
+    summarize(narrative = str_c(word, collapse = " ")) %>%
+    ungroup()
+
+raw_test <- raw_test %>%
+    select(-narrative) %>%
+    inner_join(clean_narrative)
+
+# final dataset after munging
+test <- raw_test
+# housekeeping: assign the correct type of data to each feature
+test$zip_region <- factor(test$zip_region)
+test$company <- as.character(test$company)
+test$narrative <- as.character(test$narrative)
+test$census_region <- factor(test$census_region)
+test$omb_region <- factor(test$omb_region)
+test$bea_region <- factor(test$bea_region)
+
+# final prediction ---------------------
+
+rf_test_prediction <- predict(final_fit_rf, test) %>%
+    bind_cols(predict(final_fit_rf, test, type = "prob"))
