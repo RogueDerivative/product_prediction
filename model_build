@@ -1,0 +1,132 @@
+# data -----------------------
+source("./data/train.r")
+
+## data split --------------
+set.seed(187)
+data_split <- initial_split(train, strata = "product")
+df_train <- training(data_split)
+df_valid <- testing(data_split)
+
+## folds for cross validation -------------------
+folds <- vfold_cv(data = df_train, v = 10, strata = product)
+
+# recipe -----------------------------------
+my_recipe <- df_train %>%
+    recipe(product ~ .) %>%
+    update_role(row_index, new_role = "ID") %>%
+    step_tokenize(narrative) %>%
+    step_tokenfilter(narrative, max_tokens = 100) %>%
+    step_tfidf(narrative) %>%
+    step_tokenize(company) %>%
+    step_tokenfilter(company, max_tokens = 5) %>%
+    step_tfidf(company) %>%
+    step_dummy(c(zip_region,census_region,omb_region,bea_region))
+my_prep <- prep(my_recipe)
+#juiced <- juice(my_prep)
+
+# initial_model with predefined hyperparameters: -------------
+
+initial_rf_model <- rand_forest(mtry = 3, min_n = 10, trees = 100) %>%
+    set_engine("ranger") %>%
+    set_mode("classification")
+
+rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(initial_rf_model)
+
+initial_fit_rf <- fit(rf_workflow,df_train)
+
+rf_training_prediction <- predict(initial_fit_rf, df_train) %>%
+    bind_cols(predict(initial_fit_rf,df_train, type = "prob")) %>%
+    bind_cols(df_train %>% select(product))
+
+initial_roc_auc <- rf_training_prediction %>%
+    roc_auc(truth = product,
+            c(.pred_credit_card,
+              .pred_mortgage,
+              .pred_student_loan,
+              .pred_vehicle))
+
+initial_accuracy <- rf_training_prediction %>%
+    accuracy(truth = product,.pred_class)
+
+initial_prediction_table <- bind_rows(initial_roc_auc,initial_accuracy)
+
+# redo rand_forest but this time with tuned hyperparameters and resampling
+
+rf_model <- rand_forest(
+    mode = "classification",
+    engine = "ranger",
+    mtry = tune(),
+    trees = 10,
+    min_n = tune())
+
+rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(rf_model)
+
+### parameters(rf_model) <- this is used to show which parameters are being tuned
+
+
+tune_resample <- tune_grid(
+    rf_workflow,
+    resamples = folds,
+    grid = 20)
+
+tune_resample %>%
+    collect_metrics() %>%
+    filter(.metric == "roc_auc") %>%
+    select(mean, min_n, mtry) %>%
+    pivot_longer(min_n:mtry,
+                 values_to = "value",
+                 names_to = "parameter") %>%
+    ggplot(aes(value, mean, color = parameter)) +
+    geom_point(show.legend = FALSE) +
+    facet_wrap(~parameter, scales = "free_x") +
+    labs(x = NULL, y = "AUC")
+# most recent chart appears to have higher AUC for 
+# 25 < min_n < 41 and 8 < mtry < 30
+# re-tune to limit the size of the hyperparameters
+forest_grid <- grid_regular(mtry(range = c(8,30)),
+                            min_n(range = c(25,41)),
+                            levels = 5)
+
+regular_resample <- tune_grid(
+    rf_workflow,
+    resamples = folds,
+    grid = forest_grid)
+
+regular_resample %>%
+    collect_metrics() %>%
+    filter(.metric == "roc_auc") %>%
+    mutate(min_n = factor(min_n)) %>%
+    ggplot(aes(mtry,mean,color = min_n)) +
+    geom_line(alpha = 0.5, size = 1.5) +
+    geom_point() +
+    labs(y = "AUC")
+# choose the best model ------------------
+best_auc <- select_best(regular_res, "roc_auc")
+
+
+final_rf_model <- finalize_model(rf_model,best_auc)
+
+final_rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(final_rf_model)
+
+final_fit_rf <- fit(final_rf_workflow,data = df_train)
+
+rf_valid_prediction <- predict(final_fit_rf, df_valid) %>%
+    bind_cols(predict(final_fit_rf,df_valid, type = "prob")) %>%
+    bind_cols(df_valid %>% select(product))
+
+rf_valid_prediction %>%
+    roc_auc(truth = product,
+            c(.pred_credit_card,
+              .pred_mortgage,
+              .pred_student_loan,
+              .pred_vehicle))
+
+
+rf_valid_prediction %>%
+    accuracy(truth = product,.pred_class)
