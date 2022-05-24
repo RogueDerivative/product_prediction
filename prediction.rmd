@@ -1,0 +1,568 @@
+---
+title: "product_prediction"
+author: "Nate Foulkes"
+date: "5/19/2022"
+output: html_document
+---  
+
+
+## abstract  
+
+This is the final project students must complete in order to obtain a certificate for the [Tidyverse Skills for Data Science in R Specialization](https://www.coursera.org/specializations/tidyverse-data-science-r) offered through Coursera and Carrie Wright, PhD at Johns Hopkins University. *"This Specialization is intended for data scientists with some familiarity with the R programming language who are seeking to do data science using the Tidyverse family of packages."* This project represents the final deliverable where *"learners will build and organize a data science project from scratch... wrangle non-tidy data into tidy data, visualize data with ggplot2, and build machine learning prediction models."* 
+The task is to wrangle the data to build a machine learning model that can accurately predict on 20 values of unseen data. On the unseen data the final model provided an accuracy of 0.85.  
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```  
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(tidytext)
+library(recipes)
+library(skimr)
+library(janitor)
+library(stopwords)
+library(rsample)
+library(forcats)
+library(textrecipes)# used for step_tfidf
+library(parsnip) # used for set_mode inside rand_forest
+library(workflows)# used for workflow
+library(yardstick)# used for testing the fit
+library(tune)# used to fit the cross_validation samples
+library(tidymodels)
+library(dials)# for model tuning
+library(vip)# used for finding important parameters
+```  
+
+```{r data, include=FALSE}
+raw_train <- read_csv("./data/complaints_train.csv")
+raw_test <- read_csv("./data/complaints_test.csv")
+```  
+
+## data  
+
+For this project students were provided a data set with 6 variables. Each row of the data frame represents an individual (consumer) who filed a complaint against a company about a product. All of the data is of nominal type: the variables are descriptive.  
+
+The *product*, which will be the outcome variable, is of four categories: **Student loan**, **Credit cards or prepaid cards**, **Mortgages**, **Vehicle loan or lease**. There is the *Consumer complaint narrative* (narrative): the text of a consumer complaint about a product. *State* (state): the U.S. State or Territory location of where the consumer filing the complaint resides. *Zip code* (zip_code): the U.S. five digit code for the localized area of the consumer's residence. *Company* (company): the name of the institution the consumer complaint is directed toward. Finally, *Submitted via*: the method of submission for the complaint. No other data was considered other than the 6 provided.  
+
+### exploratory_data_analysis  
+
+#### feature_names  
+Table 1 is the head of the data set. The top row are the feature names. We see they are not in the tidy format and by using the `janitor` package we can use clean_names() to tidy the feature names. The unique values within the product feature are also not tidy, plus some of the names are too long. Using recode() from `dplyr` we convert the product names into a tidy (shorter) format.  
+```{r head, include=FALSE}
+# head line
+train_head <- knitr::kable(head(raw_train,1), caption =  "Table 1: First Row of Raw Training Data",  booktabs = TRUE) 
+
+```  
+`r train_head`  
+
+From the `skimr` package, Table 2 shows us the main characteristics of our raw training data. There are no missing values and it has a 100% fill rate. All variables are of the type character. The Consumer complaint narrative has the most unique values, followed unique Zip code. Looking at the 'Submitted via' feature we notice that there is only one unique value. Further inspection shows that every entry is "Web". Since this will offer nothing in terms of predictive power we will drop this feature.  
+```{r skim, include=FALSE,fig.align='center',fig.width=5}
+# skim
+train_skim <- knitr::kable(skim(raw_train), col.names = c("type","variable","n_missing","complete_rate","min","max","empty","n_unique","whitespace"), align = "llccccccc", caption = "Table 2: Raw Training Data Skim") 
+
+```  
+`r train_skim`  
+
+```{r raw_train_initial_munge, include = FALSE}
+## clean_the_column_names
+raw_train <- clean_names(raw_train)
+## submitted_via = Web -> DROP
+raw_train <- raw_train %>%
+    select(-submitted_via)
+## don't like the column name consumer_complaint_narrative -> change to narrative
+raw_train <- raw_train %>%
+    rename("narrative" = "consumer_complaint_narrative")
+## add a raw_index for later joins
+raw_train <- raw_train %>%
+    mutate(row_index = row_number())
+
+## clean_up the product column ----------------------
+raw_train$product <- recode(raw_train$product,
+                            `Credit card or prepaid card` = "credit_card",
+                            `Mortgage`="mortgage",
+                            `Student loan` = "student_loan",
+                            `Vehicle loan or lease`="vehicle")
+
+```  
+
+```{r clean_product_names, include=FALSE}
+# tidy product names
+tidy_names <- unique(raw_train$product)
+tidy_names <- toString(paste0(tidy_names))
+
+```  
+**Tidy** - product names:  `r tidy_names`  
+
+```{r zip_code_munge, include=FALSE}
+## clean_up zip_code ---------------------
+raw_train <- raw_train %>%
+    mutate(zip_region = str_extract(zip_code,"^.{1}")) %>%
+    select(-zip_code)
+```  
+#### zip_code  
+The zip_code feature currently have 5484 unique values. Some of those values are an identifiable 5-digit zip code, some are listed as "none", and others have only the first 3-digits and XX for the last two digits. From [Wikipedia](https://en.wikipedia.org/wiki/ZIP_Code#By_geography), the very first digit of the U.S. zip code denotes a region. The second and third digit represent the sectional center facility (or localized processing center). The fourth and fifth represent the area of the city/town/village. If we select the first 3 digits of the zip_code, then we get 832 unique identifiers. In terms of time complexity 832 dummy encodings is way too many. Therefore, we will reduce zip_code to only the first number using str_extract() from the `stringr` package. The new feature consists of the ten digits 0-9 and 'N' as a place holder for "none". This new feature is named **zip_region**.  
+
+```{r state_munge, include=FALSE}
+## transform the state data into regional data -------------------
+df_state <- raw_train %>%
+    select(state,row_index)
+df_state$state <- factor(df_state$state)
+
+# census_region 
+df_state$census_region <- fct_collapse(df_state$state,
+    northeast = c("CT","ME","MA","NH","RI","VT","NJ","NY","PA"),
+    midwest = c("IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD"),
+    south = c("DE","FL","GA","MD","NC","SC","VA","DC","WV","AL","KY","MS","TN",
+              "AR","LA","OK","TX"),
+    west = c("AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA"),
+    other = c("AA","AE","AP","AS","FM","GU","MH","None","PR",
+              "UNITED STATES MINOR OUTLYING ISLANDS","VI"))
+
+# omb_region
+df_state$omb_region <- fct_collapse(df_state$state,
+    I = c("CT","ME","MA","NH","RI","VT"),
+    II = c("NJ","NY","PR","VI"),
+    III = c("DE","DC","MD","PA","VA","WV"),
+    IV = c("AL","FL","GA","KY","MS","NC","SC","TN"),
+    V = c("IL","IN","MI","MN","OH","WI"),
+    VI = c("AR","LA","NM","OK","TX"),
+    VII = c("IA","KS","MO","NE"),
+    VIII = c("CO","MT","ND","SD","UT","WY"),
+    IX = c("AZ","CA","HI","NV","AS","GU",
+           "UNITED STATES MINOR OUTLYING ISLANDS"),
+    X = c("AK","ID","OR","WA"),
+    other = c("AA","AE","AP","FM","MH","None"))
+
+# bea_region
+df_state$bea_region <- fct_collapse(df_state$state,
+    new_england = c("CT","ME","MA","NH","RI","VT"),
+    mideast = c("DE","DC","MD","NJ","NY","PA"),
+    great_lakes = c("IL","IN","MI","OH","WI"),
+    plains = c("IA","KS","MN","MO","NE","ND","SD"),
+    southeast = c("AL","AR","FL","GA","KY","LA","MS","NC","SC","TN","VA","WV"),
+    southwest = c("AZ","NM","OK","TX"),
+    rocky_mountain = c("CO","ID","MT","UT","WY"),
+    far_west = c("AK","CA","HI","NV","OR","WA"),
+    other = c("AA","AE","AP","AS","FM","GU","MH","None","PR",
+              "UNITED STATES MINOR OUTLYING ISLANDS","VI"))
+# join the new regions to the raw_training data
+raw_train <- inner_join(raw_train,
+                        df_state, 
+                        by = c("row_index","state")) %>% 
+    select(-state)
+## clean_up df_state for use later on the testing set
+df_state <- df_state %>%
+    select(-row_index)
+# will be used later on test data
+df_region <- distinct(df_state)
+
+```  
+#### state  
+The results of the skim in Table 2 told us that there are 62 unique values here. This is simply too many to convert to a dummy variable. In an effort to keeping the state feature, and the fact that I currently reside in the "Midwest" of the U.S., we consider reducing down these state/territory values into smaller regions. [Wikipedia](https://en.wikipedia.org/wiki/List_of_regions_of_the_United_States) provided material to enable us to cluster the states. Using fct_collapse() from the `forcats` package allowed us to create three new features from the state data. The *U.S. Census Bureau* cluster the 50 states together into four regions, named **census_region**. The ten *Standard Federal Regions* (used by the Office of Management and Budget) takes the 50 states and some of the territories to then break those into 10 subgroups using Roman Numerals, named **omb_region**. The last set of grouping follows the *Bureau of Economic Analysis* where all of the 50 states and some of the territories are put into 8 sub-regions, named **bea_region**. For each of these new features if a state value was not included within the defined regions, then those values are coded as "other".  
+
+```{r new_regions, include=FALSE}
+# tidy census names
+census_names <- unique(raw_train$census_region)
+census_names <- toString(paste0(census_names))
+# tidy omb names
+omb_names <- unique(raw_train$omb_region)
+omb_names <- toString(paste0(omb_names))
+# tidy bea name 
+bea_names <- unique(raw_train$bea_region)
+bea_names <- toString(paste0(bea_names))
+```  
+**Tidy** Census regions:  `r census_names`  
+**Tidy** OMB regions:  `r omb_names`  
+**Tidy** BEA regions:  `r bea_names`  
+
+```{r compnay_munge, include=FALSE}
+# clean_up company ----------------------------
+## first: unnest the company feature
+company_words <- raw_train %>%
+    select(company) %>%
+    unnest_tokens(word,company) %>%
+    filter(!word %in% stop_words$word) %>%
+    count(word, sort = TRUE) 
+## second: only grab company words that occur more than 50 times
+company_words <- company_words %>%
+    filter(n>50)
+## third: from viewing the data there are additional abbreviations -
+## get rid of them
+my_stop_words <- tibble(word = 
+                            c("llc","n.a","ld","lp","na","fc","de","sn","pc"))
+## fourth: remove those abbreviations from the remaining company words
+company_words <- company_words %>%
+    filter(!word %in% my_stop_words$word)
+## fifth: create a table for use in cleaning the testing data
+company_words <- company_words %>%
+    select(word)
+## sixth: re-clean the company feature
+df_company <- raw_train %>%
+    select(company, row_index) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word, company) %>%
+    filter(word %in% company_words$word) %>%
+    summarise(company = str_c(word, collapse = " ")) %>%
+    ungroup()
+## seventh: get rid of the untidy company feature
+raw_train <- raw_train %>%
+    select(-company)
+## eighth: join cleaned company onto the raw_train
+raw_train <- inner_join(raw_train,
+                        df_company,
+                        by = "row_index")
+```  
+#### company  
+There were originally 1497 unique values for the named companies. Using the `tidytext` package we tokenized the company feature, removed common `stop_words`, removed additional abbreviations (such as llc, na, pc, et al), limited the number of words to the 50 most frequently found, and then brought these words back together using str_c() from the `stringr` package to get 511 distinct company names. This new feature will be re-tokenized in the recipe, limited to 5 max_tokens, and use the term frequency inverse document frequency function, or step_tfidf(), to create a sparse matrix made up of numerical measures.  
+
+```{r narrative_munge, include=FALSE}
+# clean_up narrative ----------------------------
+# the term frequency inverse document frequency of the narrative
+narrative_tf_idf <- raw_train %>%
+    select(product, row_index, narrative) %>%
+    unnest_tokens(word,narrative)  %>%
+    anti_join(stop_words) %>%
+    filter(!str_detect(word,"\\d")) %>%
+    filter(str_detect(word,"[a-z]")) %>%
+    filter(!str_detect(word,"X{1,}")) %>%
+    filter(!str_detect(word,"x{1,}")) %>%
+    count(product, word, sort = TRUE) %>%
+    bind_tf_idf(word, product, n) %>%
+    arrange(desc(tf_idf))
+# 15000 words for each product with the highest tf_idf
+narrative_words <- narrative_tf_idf %>%
+    group_by(product) %>%
+    slice_max(tf_idf, n = 15000) %>%
+    ungroup() %>%
+    select(word)
+# grab the distinct words
+narrative_words <- narrative_words %>% distinct()
+# table used to switch old narrative with new narrative
+narrative_df <- raw_train %>%
+    select(row_index, narrative) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word,narrative)  %>%
+    filter(word %in% narrative_words$word) %>%
+    summarize(narrative = str_c(word, collapse = " ")) %>%
+    ungroup()
+# join the new narrative to raw_train
+raw_train <- raw_train %>%
+    select(-narrative)
+raw_train <- inner_join(raw_train,
+                        narrative_df,
+                        by = "row_index")
+```  
+#### narrative  
+Plot 1 gives us an idea of which terms appear most frequently in relationship to the type of product the narrative is attached to. From the same plot we notice that the 15 most related words with each product are unique to that product. When the **tidy** training data is run through the recipe the step_tokenfilter() will limit the number of tokens to 500.   
+
+```{r narrative_plot, echo = FALSE, fig.show='asis'}
+# narrative tf_idf by product plot
+narrative_tf_idf %>%
+    group_by(product) %>%
+    slice_max(tf_idf, n = 15) %>%
+    ungroup() %>%
+    ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = product)) +
+           geom_col(show.legend = FALSE) +
+    facet_wrap(~ product, ncol = 2, scales = "free") +
+    labs(x = "tf_idf", y = NULL, title = "Plot 1: Term Frequency Inverse Document Frequency by Product")
+```  
+
+```{r final_train, include=FALSE}
+# this will be the final dataset used to train the model
+train <- raw_train 
+# housekeeping: assign the correct type of data to each feature
+train$product <- factor(train$product)
+train$zip_region <- factor(train$zip_region)
+train$company <- as.character(train$company)
+train$narrative <- as.character(train$narrative)
+train$census_region <- factor(train$census_region)
+train$omb_region <- factor(train$omb_region)
+train$bea_region <- factor(train$bea_region)
+```  
+## random_forest_model  
+The end deliverable is a random forest (rand_forest()), classification, prediction model as part of the `parsnip` package. We used the "ranger" engine.  
+
+There are three hyper-parameters: mtry (an integer for the number of predictors that will be randomly sampled at each split when creating the tree models), min_n (an integer for the minimum number of data points in a node that are required for the node to be split further), and trees (an integer for the number of trees contained in the ensemble).  
+
+The model is run twice. The first model has set parameter values of mtry = 3, min_n = 10, and trees = 40. We then used cross-validation folds to tune mtry and min_n to get the best prediction model we could. (trees in the second model were kept equal to 40).  
+
+#### data_splitting  
+```{r data_split, include=FALSE}
+
+## data split --------------
+set.seed(187)
+data_split <- initial_split(train, strata = "product")
+df_train <- training(data_split)
+df_valid <- testing(data_split)
+
+```  
+We took the initial complaints_train.csv file provided, using initial_split() from the `rsample` package, to split the data into two sub-groups using the outcome feature *product* as the strata. The larger subset is for the initial training of the model and the smaller subset is used for validating the accuracy of the model.  
+
+```{r folds, include=FALSE}
+
+## folds for cross validation -------------------
+folds <- vfold_cv(data = df_train, v = 10, strata = product)
+
+```  
+#### cross_validation  
+From the `rsample` package we used the vfold_cv() function to split the larger training subgroup into partitions of 10 using **product** as the strata. 
+
+```{r recipe, include=FALSE}
+
+# recipe -----------------------------------
+my_recipe <- df_train %>%
+    recipe(product ~ .) %>%
+    update_role(row_index, new_role = "ID") %>%
+    step_tokenize(narrative) %>%
+    step_tokenfilter(narrative, max_tokens = 500) %>%
+    step_tfidf(narrative) %>%
+    step_tokenize(company) %>%
+    step_tokenfilter(company, max_tokens = 5) %>%
+    step_tfidf(company) %>%
+    step_dummy(c(zip_region,census_region,omb_region,bea_region))
+prep(my_recipe)
+
+```  
+#### create_the_recipe  
+From the `recipes` package our recipe function set the **product** as the outcome feature; updated the role of the row_index to be an ID; tokenized the **narrative** to 100 max_tokens and converted those tokens into a sparse matrix of term frequency inverse document frequency (step_tfidf()) values; tokenized **company** to 5 max_tokens and created more tf_idf values; lastly we created dummy variables of **zip_region**, **census_region**, **omb_region**, and **bea_region**.  
+
+```{r initial_model, include=FALSE}
+
+# initial_model with predefined hyperparameters: -------------
+initial_rf_model <- rand_forest(mtry = 3, min_n = 10, trees = 40) %>%
+    set_engine("ranger") %>%
+    set_mode("classification")
+# initial_workflow
+rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(initial_rf_model)
+
+```  
+#### workflow  
+We use the workflow() function from the `workflows` package because it provides an easy way to update the process of building a prediction model without requiring the entire model to be run again. If a follow-up report was needed to be considered using a different predictor model, then our workflow can be updated using a new add_model step and the recipe would not need to run again.   
+## testing_the_model  
+We used two metrics for how well the model performed. The first is the roc_auc measure: the area under the receiver operating characteristic curve. The **ROC** measures the performance of a classification model by plotting the rate of true positives against false positives. Values closer to 1 imply better predictions. The second metric is accuracy: the proportion of correct classifications, also, values closer to 1 imply a higher accuracy rate.  
+
+```{r initial_fit, include=FALSE}
+
+# initial_fit
+initial_fit_rf <- fit(rf_workflow,df_train)
+
+```  
+
+```{r initial_prediction, include=FALSE}
+
+# initial_prediction
+rf_training_prediction <- predict(initial_fit_rf, df_train) %>%
+    bind_cols(predict(initial_fit_rf,df_train, type = "prob")) %>%
+    bind_cols(df_train %>% select(product))
+# collect_metrics
+initial_roc_auc <- rf_training_prediction %>%
+    roc_auc(truth = product,
+            c(.pred_credit_card,
+              .pred_mortgage,
+              .pred_student_loan,
+              .pred_vehicle))
+initial_accuracy <- rf_training_prediction %>%
+    accuracy(truth = product,.pred_class)
+# create a table
+initial_prediction_table <- bind_rows(initial_roc_auc,initial_accuracy)
+
+```  
+### initial_model_outcome  
+Table 4 provides the results of our initial model. These values (especially the roc_auc) are quite high and give us a sense of skepticism. (It should be noted that getting a value equal to 1 is not good because it indicates that the model may have over-learned the data).   
+```{r init_pred_table, include=FALSE}
+
+initial_prediction_table <- clean_names(initial_prediction_table)
+initial_prediction_table <- knitr::kable(initial_prediction_table, "pipe", digits = 4, caption = "Table 3: ROC_AUC and Accuracy for Initial Prediction Model")
+
+```  
+`r initial_prediction_table`  
+
+Such high values should be given taken with a grain of salt. A random forest model is generally considered one of the better models to use for classification prediction. However, when the initial roc_auc value is very close to 1 then this implies that the model "over-learned" the training data.  
+
+```{r add_hyper, include=FALSE}
+
+# redo rand_forest but this time with tuned hyperparameters and resampling
+rf_model <- rand_forest(
+    mode = "classification",
+    engine = "ranger",
+    mtry = tune(),
+    trees = 40,
+    min_n = tune())
+# new workflow
+rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(rf_model)
+
+```  
+```{r cores, include=FALSE}
+# Windows code for reduction in time complexity
+all_cores <- parallel::detectCores(logical = FALSE)
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+```
+```{r tuning_grid, include=FALSE}
+
+# tuning grid for resampling
+tune_resample <- tune_grid(
+    rf_workflow,
+    resamples = folds,
+    grid = 10)
+
+```  
+### resampled_model  
+To, hopefully, provide a better prediction model we use tune_grid from the `tune` package combined with 10 re-sampled subgroups from the *train* data set. The grid parameter inside tune_grid creates a data frame with columns for each parameter being tuned and rows for tuning parameter candidates. We chose the grid size to be 10.  
+
+```{r resample_plot, echo = FALSE, fig.show='asis', fig.align='center'}
+## ggplot of auc values for tuned hyperparameters
+tune_resample %>%
+    collect_metrics() %>%
+    filter(.metric == "roc_auc") %>%
+    select(mean, min_n, mtry) %>%
+    pivot_longer(min_n:mtry,
+                 values_to = "value",
+                 names_to = "parameter") %>%
+    ggplot(aes(value, mean, color = parameter)) +
+    geom_point(show.legend = FALSE) +
+    facet_wrap(~parameter, scales = "free_x") +
+    labs(x = NULL, y = "AUC",
+         title = "Plot 2: AUC for the 10 Tuned Hyperparameters")
+
+```  
+Plot 2 describes the **AUC** measure for the ten re-sampled tuned hyperparameters. Fortunately we do not need to approximate which parameters would be the best combination. The `tune` package has a function called select_best that will select the combination of mtry and min_n that provides the best **AUC** measure.  
+
+```{r best_hyper, include=FALSE}
+
+# select the best hyperparemeters
+best_auc <- select_best(tune_resample, "roc_auc")
+best_auc_table <- knitr::kable(best_auc, "pipe", digits = 4, col.names = c("mtry","min_n","configuration"), align = "ccc", caption = "Table 4: The Best Combination of Tuned Hyperparameters")
+
+```  
+`r best_auc_table`  
+
+#### validation_metrics  
+The model was run one last time on the reserved validation set. From Table 5 we see that the model performed exceedingly well. The values are not equal to 1 so that will not stop us from predicting on the unseen data.  
+
+```{r final_model, include=FALSE}
+# final model with the best metrics
+final_rf_model <- finalize_model(rf_model,best_auc)
+
+```  
+```{r final_fit, include=FALSE}
+# final workflow
+final_rf_workflow <- workflow() %>%
+    add_recipe(my_recipe) %>%
+    add_model(final_rf_model)
+# final fit
+final_fit_rf <- fit(final_rf_workflow,data = df_train)
+
+```  
+```{r valid_predictions, include=FALSE}
+# predict using the validation set
+rf_valid_prediction <- predict(final_fit_rf, df_valid) %>%
+    bind_cols(predict(final_fit_rf,df_valid, type = "prob")) %>%
+    bind_cols(df_valid %>% select(product))
+
+```  
+```{r valid_roc_auc_acc, include=FALSE}
+# roc_auc with validation set
+valid_pred <- rf_valid_prediction %>% 
+    roc_auc(truth = product,
+            c(.pred_credit_card,
+              .pred_mortgage,
+              .pred_student_loan,
+              .pred_vehicle))
+# accuracy using validation set
+valid_acc <- rf_valid_prediction %>%
+    accuracy(truth = product,.pred_class)
+# validation metrics table
+valid_metrics <- bind_rows(valid_pred, valid_acc)
+
+```  
+```{r valid_metric_table, include=FALSE}
+# valid_metrics_table 
+valid_metrics <- knitr::kable(valid_metrics, "pipe", digits = 4, col.names = c("metric","estimator","estimate"), caption = "Table 5: Validation Metrics")
+
+```  
+`r valid_metrics`
+
+## final_predictions  
+```{r test_munge, include=FALSE}
+# test data clean-up----------------
+## clean_the_column_names
+raw_test <- clean_names(raw_test)
+## submitted_via = Web -> DROP
+raw_test<- raw_test %>%
+    select(-submitted_via)
+## don't like the column name consumer_complaint_narrative -> change to narrative
+raw_test <- raw_test %>%
+    rename("narrative" = "consumer_complaint_narrative")
+## need to rename problem_id as row_index
+raw_test <- raw_test %>%
+    rename(row_index = problem_id)
+## clean_up zip_code ---------------------
+raw_test <- raw_test %>%
+    mutate(zip_region = str_extract(zip_code,"^.{1}")) %>%
+    select(-zip_code)
+## clean_up state -------------------
+# df_region was created during raw_train munge
+raw_test <- raw_test %>% 
+    left_join(df_region) %>%
+    select(-state)
+# clean_up company ----------------------------
+clean_company <- raw_test %>%
+    group_by(row_index) %>%
+    unnest_tokens(word, company) %>%
+    filter(word %in% company_words$word) %>%
+    summarize(company = str_c(word, collapse = " ")) %>%
+    ungroup()
+raw_test <- raw_test %>% 
+    select(-company) %>%
+    inner_join(clean_company)
+# clean_up narrative ----------------------------
+clean_narrative <- raw_test %>%
+    select(row_index, narrative) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word,narrative)  %>%
+    filter(word %in% narrative_words$word) %>%
+    summarize(narrative = str_c(word, collapse = " ")) %>%
+    ungroup()
+raw_test <- raw_test %>%
+    select(-narrative) %>%
+    inner_join(clean_narrative)
+# final dataset after munging
+test <- raw_test
+# housekeeping: assign the correct type of data to each feature
+test$zip_region <- factor(test$zip_region)
+test$company <- as.character(test$company)
+test$narrative <- as.character(test$narrative)
+test$census_region <- factor(test$census_region)
+test$omb_region <- factor(test$omb_region)
+test$bea_region <- factor(test$bea_region)
+```  
+```{r test_prediction, include=FALSE}
+# final prediction ---------------------
+rf_test_prediction <- predict(final_fit_rf, test) %>%
+    bind_cols(predict(final_fit_rf, test, type = "prob"))
+# add a row_index to final table
+rf_test_prediction <- rf_test_prediction %>%
+    add_column(row_index = 1:20, .before = ".pred_class")
+rf_test_prediction <- knitr::kable(rf_test_prediction, "pipe", col.names = c("row_index","product","credit_card","mortgage","student_loan","vehicle"), align = "llcccc", digits = 4, caption = "Table 6: Test Predictions")
+
+```  
+
+`r rf_test_prediction`
+
+Our skepticism in regard to over-learning the training set was warranted in the end: on the unseen data the final model provided an accuracy of 0.90. 
+
+# Appendix: r code   
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+
+```
