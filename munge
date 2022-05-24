@@ -1,0 +1,215 @@
+# munge
+
+# libraries ------------------
+library(tidyverse)
+library(tidytext)
+library(recipes)
+library(skimr)
+library(janitor)
+library(rsample)
+library(forcats)
+library(textrecipes)# used for step_tfidf
+library(parsnip) # used for set_mode inside rand_forest
+library(workflows)# used for workflow
+library(yardstick)# used for testing the fit
+library(tune)# used to fit the cross_validation samples
+library(tidymodels)
+library(dials)# for model tuning
+library(vip)
+
+# data----------------------------
+raw_train <- read_csv("./data/complaints_train.csv")
+## clean_the_column_names
+raw_train <- clean_names(raw_train)
+## submitted_via = Web -> DROP
+raw_train <- raw_train %>%
+    select(-submitted_via)
+## don't like the column name consumer_complaint_narrative -> change to narrative
+raw_train <- raw_train %>%
+    rename("narrative" = "consumer_complaint_narrative")
+## add a raw_index for later joins
+raw_train <- raw_train %>%
+    mutate(row_index = row_number())
+
+## clean_up the product column ----------------------
+raw_train$product <- recode(raw_train$product,
+                            `Credit card or prepaid card` = "credit_card",
+                            `Mortgage`="mortgage",
+                            `Student loan` = "student_loan",
+                            `Vehicle loan or lease`="vehicle")
+dump("raw_train", file = "./data/raw_train.r")
+source("./data/raw_train.r")
+## clean_up zip_code ---------------------
+### from wikipedia https://en.wikipedia.org/wiki/ZIP_Code#By_geography
+### the first digit of a zip code denotes a region
+df_zip <- raw_train %>%
+    select(zip_code,row_index)
+zip_count <- df_zip %>%
+    count(zip_code)
+### 5484 unique observations 
+### some values are complete, some values have the last two numbers 
+### represented as XX, there are 21557 observations of "None"
+### let's reduce the size of the zip_code to only the first number
+df_zip <- df_zip %>%
+    mutate(zip_region = str_extract(zip_code,"^.{1}")) %>%
+    select(-zip_code)
+df_zip$zip_region <- factor(df_zip$zip_region)
+zip_region_count <- df_zip %>%
+    count(zip_region) # tibble of the number of observations in each zip_region
+# join onto raw_train
+raw_train <- inner_join(raw_train,df_zip)
+raw_train <- raw_train %>%
+    select(-zip_code)
+
+#### short/short version of zip clean-up -------------
+raw_train <- raw_train %>%
+    mutate(zip_region = str_extract(zip_code,"^.{1}")) %>%
+    select(-zip_code)
+
+
+## clean_up state -------------------
+df_state <- raw_train %>%
+    select(state,row_index)
+state_count <- df_state %>%
+    count(state)
+### why is there 62 unique state ids?
+### from the state_count tibble there are 3 options for Armed Forces:
+###     AA, AE, AP for a total = 81
+### there is a category of UNITED STATES MINOR OUTLYING ISLANDS = 15, 
+###     along with American Samoa (AS = 2), Micronesia (FM = 8), Guan (GU = 11),
+###     Marshall Islands (MH = 1), Puerto Rico (PR = 192), 
+###     U.S. Virgin Islands (VI = 11)
+### lastly there is a "None" category of 349
+
+## transform the state data into region data
+# census_region 
+
+df_state$state <- factor(df_state$state)
+df_state$census_region <- fct_collapse(df_state$state,
+    northeast = c("CT","ME","MA","NH","RI","VT","NJ","NY","PA"),
+    midwest = c("IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD"),
+    south = c("DE","FL","GA","MD","NC","SC","VA","DC","WV","AL","KY","MS","TN",
+              "AR","LA","OK","TX"),
+    west = c("AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA"),
+    other = c("AA","AE","AP","AS","FM","GU","MH","None","PR",
+              "UNITED STATES MINOR OUTLYING ISLANDS","VI"))
+
+# omb_region
+df_state$omb_region <- fct_collapse(df_state$state,
+    I = c("CT","ME","MA","NH","RI","VT"),
+    II = c("NJ","NY","PR","VI"),
+    III = c("DE","DC","MD","PA","VA","WV"),
+    IV = c("AL","FL","GA","KY","MS","NC","SC","TN"),
+    V = c("IL","IN","MI","MN","OH","WI"),
+    VI = c("AR","LA","NM","OK","TX"),
+    VII = c("IA","KS","MO","NE"),
+    VIII = c("CO","MT","ND","SD","UT","WY"),
+    IX = c("AZ","CA","HI","NV","AS","GU",
+           "UNITED STATES MINOR OUTLYING ISLANDS"),
+    X = c("AK","ID","OR","WA"),
+    other = c("AA","AE","AP","FM","MH","None"))
+
+# bea_region
+df_state$bea_region <- fct_collapse(df_state$state,
+    new_england = c("CT","ME","MA","NH","RI","VT"),
+    mideast = c("DE","DC","MD","NJ","NY","PA"),
+    great_lakes = c("IL","IN","MI","OH","WI"),
+    plains = c("IA","KS","MN","MO","NE","ND","SD"),
+    southeast = c("AL","AR","FL","GA","KY","LA","MS","NC","SC","TN","VA","WV"),
+    southwest = c("AZ","NM","OK","TX"),
+    rocky_mountain = c("CO","ID","MT","UT","WY"),
+    far_west = c("AK","CA","HI","NV","OR","WA"),
+    other = c("AA","AE","AP","AS","FM","GU","MH","None","PR",
+              "UNITED STATES MINOR OUTLYING ISLANDS","VI"))
+df_region <- df_state %>%
+    select(-row_index)
+df_region <- distinct(df_region)
+
+dump("df_region", file = "./data/df_region.r")
+raw_train <- inner_join(raw_train,
+                        df_state, 
+                        by = c("row_index","state")) %>% 
+    select(-state)
+
+# clean_up company ----------------------------
+library(tidytext)
+## first: unnest the company feature
+company_words <- raw_train %>%
+    select(company) %>%
+    unnest_tokens(word,company) %>%
+    filter(!word %in% stop_words$word) %>%
+    count(word, sort = TRUE) 
+## second: only grab company words that occur more than 50 times
+company_words <- company_words %>%
+    filter(n>50)
+## third: from viewing the data there are additional abbreviations -
+## get rid of them
+my_stop_words <- tibble(word = c("llc","n.a","ld","lp","na","fc","de","sn","pc"))
+## fourth: remove those abbreviations from the remaining company words
+company_words <- company_words %>%
+    filter(!word %in% my_stop_words$word)
+## fifth: create a table for use in cleaning the testing data
+company_words <- company_words %>%
+    select(word)
+dump("company_words", file = "./data/company_words.r")
+## sixth: re-clean the company feature
+df_company <- raw_train %>%
+    select(company, row_index) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word, company) %>%
+    filter(word %in% company_words$word) %>%
+    summarise(company = str_c(word, collapse = " ")) %>%
+    ungroup()
+## seventh: get rid of the untidy company feature
+raw_train <- raw_train %>%
+    select(-company)
+## eighth: join cleaned company onto the raw_train
+raw_train <- inner_join(raw_train,
+                        df_company,
+                        by = "row_index")
+
+# clean_up narrative ----------------------------
+# the term frequency inverse document frequency of the narrative
+narrative_tf_idf <- raw_train %>%
+    select(product, row_index, narrative) %>%
+    unnest_tokens(word,narrative)  %>%
+    filter(!word %in% stop_words$word) %>%
+    filter(!str_detect(word,"\\d")) %>%
+    filter(str_detect(word,"[a-z]")) %>%
+    filter(!str_detect(word,"X{1,}")) %>%
+    filter(!str_detect(word,"x{1,}")) %>%
+    count(product, word, sort = TRUE) %>%
+    bind_tf_idf(word, product, n) %>%
+    arrange(desc(tf_idf))
+# 200 words for each product with the highest tf_idf
+narrative_words <- narrative_tf_idf %>%
+    group_by(product) %>%
+    slice_max(tf_idf, n = 10000) %>%
+    ungroup() %>%
+    select(word)
+narrative_words <- narrative_words %>% distinct()
+dump("narrative_words", file = "./data/narrative_words.r")
+# table used to switch old narrative with new narrative
+narrative_df <- raw_train %>%
+    select(row_index, narrative) %>%
+    group_by(row_index) %>%
+    unnest_tokens(word,narrative)  %>%
+    filter(word %in% product_words$word) %>%
+    summarize(narrative = str_c(word, collapse = " ")) %>%
+    ungroup()
+# join the new narrative to raw_train
+raw_train <- raw_train %>%
+    select(-narrative)
+raw_train <- inner_join(raw_train,
+                        narrative_df,
+                        by = "row_index")
+# this will be the final dataset used to train the model
+train <- raw_train 
+# housekeeping: assign the correct type of data to each feature
+train$product <- factor(train$product)
+train$zip_region <- factor(train$zip_region)
+train$company <- as.character(train$company)
+train$narrative <- as.character(train$narrative)
+train$census_region <- factor(train$census_region)
+train$omb_region <- factor(train$omb_region)
+train$bea_region <- factor(train$bea_region)
