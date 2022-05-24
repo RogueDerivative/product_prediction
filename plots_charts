@@ -1,0 +1,40 @@
+# chart of AUC for varying mtry and min_n
+regular_res %>%
+    collect_metrics() %>%
+    filter(.metric == "roc_auc") %>%
+    mutate(min_n = factor(min_n)) %>%
+    ggplot(aes(mtry,mean,color = min_n)) +
+    geom_line(alpha = 0.5, size = 1.5) +
+    geom_point() +
+    labs(y = "AUC")
+
+
+# wordcloud for narrative --------------
+my_df <- raw_train %>%
+    select(product, row_index, narrative)
+product_words <- my_df %>%
+    unnest_tokens(word,narrative)  %>%
+    anti_join(stop_words) %>%
+    filter(!str_detect(word,"\\d")) %>%
+    filter(str_detect(word,"[a-z]")) %>%
+    filter(!str_detect(word,"X{1,}")) %>%
+    filter(!str_detect(word,"x{1,}")) %>%
+    count(product, word, sort = TRUE)
+
+product_tf_idf <- product_words %>%
+    bind_tf_idf(word, product, n) %>%
+    arrange(desc(tf_idf))
+
+product_word_tf_idf_plot <- product_tf_idf %>%
+    group_by(product) %>%
+    slice_max(tf_idf, n = 15) %>%
+    ungroup() %>%
+    ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = product)) +
+           geom_col(show.legend = FALSE) +
+    facet_wrap(~ product, ncol = 2, scales = "free") +
+    labs(x = "tf_idf", y = NULL)
+
+# wordcloud 
+narrative_word_cloud <- narrative_df %>%
+    count(word) %>%
+    with(wordcloud(word,n,max.words = 20))
